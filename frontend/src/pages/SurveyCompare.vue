@@ -6,11 +6,13 @@
  */
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus } from '@element-plus/icons-vue'
+import { Connection, Delete, Edit, Plus, Tickets } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import LevelTag from '@/components/common/LevelTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import CrackMergeDialog from '@/components/CrackMergeDialog.vue'
+import CrackMergeHistory from '@/components/CrackMergeHistory.vue'
 import { useCrackStore, type CrackEnriched } from '@/stores/crackStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { useSectionStore } from '@/stores/sectionStore'
@@ -171,6 +173,24 @@ async function removeSurvey(surveyId: string, seq: number): Promise<void> {
 function selectCrack(crackId: string): void {
   surveyStore.setActiveCrack(crackId)
 }
+
+/* ---------------------------- 裂缝归并 ---------------------------- */
+
+const mergeDialogVisible = ref(false)
+const mergeHistoryVisible = ref(false)
+
+function openMerge(): void {
+  if (candidateCracks.value.length < 2) {
+    ElMessage.warning('同一环片需要至少两条裂缝才能归并')
+    return
+  }
+  mergeDialogVisible.value = true
+}
+
+function onMerged(primaryCrackId: string): void {
+  // 被并裂缝已删除，列表/曲线由 liveQuery 自动刷新；保持选中主裂缝查看重排后的测次
+  surveyStore.setActiveCrack(primaryCrackId)
+}
 </script>
 
 <template>
@@ -183,6 +203,10 @@ function selectCrack(crackId: string): void {
         </p>
       </div>
       <div class="page-head__actions">
+        <el-button :icon="Tickets" @click="mergeHistoryVisible = true">归并记录</el-button>
+        <el-button type="warning" plain :icon="Connection" :disabled="candidateCracks.length < 2" @click="openMerge">
+          裂缝归并
+        </el-button>
         <el-button type="primary" :icon="Plus" :disabled="!activeCrackId" @click="openCreate">追加测次</el-button>
       </div>
     </div>
@@ -360,6 +384,14 @@ function selectCrack(crackId: string): void {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <CrackMergeDialog
+      v-model="mergeDialogVisible"
+      :candidates="candidateCracks"
+      :default-primary-id="activeCrackId"
+      @merged="onMerged"
+    />
+    <CrackMergeHistory v-model="mergeHistoryVisible" />
   </div>
 </template>
 
