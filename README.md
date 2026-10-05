@@ -53,7 +53,7 @@ sologsb101-1006/
     ├── package.json / tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/              # section.ts ring.ts crack.ts survey.ts advice.ts
+        ├── types/              # section.ts ring.ts crack.ts survey.ts advice.ts merge.ts
         ├── stores/             # sectionStore.ts crackStore.ts surveyStore.ts
         ├── components/common/  # LevelTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useCrackTrend.ts useIdbTable.ts
@@ -71,16 +71,16 @@ sologsb101-1006/
 | --- | --- | --- | --- |
 | `/sections` | 区间与环片里程台账 | Section、Ring | 新建/编辑/删除区间与环片；按线路、结构型式筛选；里程区间二维筛选；展开环片查看裂缝 |
 | `/cracks` | 裂缝初测录入 | Crack、Ring | 新增/编辑/删除裂缝；勾选批量改状态；单条状态流转（观察→待整治→已整治）；导出 CSV |
-| `/surveys` | 复测测次与变化量对比 | Survey、Crack | 按测次追加读数（自动比对生成变化量）；SVG 折线对比历次宽度；编辑/删除测次 |
+| `/surveys` | 复测测次与变化量对比 | Survey、Crack、CrackMerge | 按测次追加读数（自动比对生成变化量）；SVG 折线对比历次宽度；编辑/删除测次；**裂缝归并**（同环片重复录入的两条裂缝按日期核对读数后合并） |
 | `/trends` | 发展速率分级与预警 | Crack、Survey、Advice | 按月均速率降序排行；仅看预警开关；一键生成整治建议草稿；抽屉查看测次序列 |
 | `/backup` | 整治建议与数据备份 | 全部模型 | 建议状态流转（待下发→已下发→已完成）；导出/导入全量 JSON；导出 CSV；清空/重置演示数据 |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbtunnelcrack`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`sections`、`rings`、`cracks`、`surveys`、`advices`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的 `stores()` 索引变更与 `upgrade()` 迁移逻辑（补齐行修订号 `revision`、用所属环片回填历史裂缝的 `sectionId` 冗余列、补齐缺失的变化量字段）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.sections.count() === 0) await seedDatabase()`，播种 2 个区间 → 5 个环片 → 6 条裂缝 → 14 个测次 → 4 条建议的互相引用演示数据；播种为幂等操作，重复调用不会重复插入
+- **对象表**：`sections`、`rings`、`cracks`、`surveys`、`advices`、`crackMerges`（裂缝归并记录）
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1)` → `version(3)` 的 `stores()` 索引变更与 `upgrade()` 迁移逻辑（补齐行修订号 `revision`、用所属环片回填历史裂缝的 `sectionId` 冗余列、补齐缺失的变化量字段；v3 新增归并记录表并把既有五行戳到行修订号 3）
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.sections.count() === 0) await seedDatabase()`，播种 2 个区间 → 5 个环片 → 7 条裂缝（含一对同环片同编号 `SL-118-02` 的重复录入裂缝，供演练归并）→ 17 个测次 → 4 条建议的互相引用演示数据；播种为幂等操作，重复调用不会重复插入
 - **localStorage 辅助键**：`gbtunnelcrack:db-version`（结构版本号）、`gbtunnelcrack:last-backup-at`（最近备份时间）、`gbtunnelcrack:ui-prefs`（上次选中区间、仅看预警开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷；清理浏览器数据即清空业务数据（可在 `/backup` 页重新播种）
 
@@ -101,3 +101,14 @@ npm run preview    # 本地预览构建产物
 - 月均速率 `mm/月 = (本次宽度 − 上次宽度) ÷ 间隔天数 × 30`
 - 分级阈值：`< 0.10` 一般，`0.10 ~ 0.25` 较重，`≥ 0.25` 严重
 - 预警数 = 速率分级为「较重」及以上的裂缝数量
+
+## 八、裂缝归并口径（`/surveys` 页）
+
+同一环片的裂缝编号被重复录入、复测页留着两条记录各算一遍测次/变化量/建议时，用「裂缝归并」并成一条：
+
+1. 选择主裂缝与被并裂缝，先按日期预览两边测次，把**重复日期的两条读数并排核对**；默认保留宽度较大的读数（等宽默认主裂缝），核验人可逐条改选，**漏选不能保存**，避免把两条读数差误当成新增变化。
+2. 被并裂缝独有的日期读数转入主裂缝；确认后统一**按日期重排序次，重算变化量、月均速率与建议依据**（措施不变）；被并侧「待下发」建议注销。
+3. 被并裂缝注销、编号仅留存在 `crackMerges` 归并记录（含逐日期保留/放弃的测次 id、核验人、归并时间），图表、速率排行与建议只认主裂缝。
+4. 限制：两条裂缝**跨环片**、或任一侧已有**已下发 / 已完成**建议时不能直接并；主裂缝、被并裂缝任一已处于归并关系中也拒绝重复归并。
+5. 归并在**单个 Dexie 读写事务**内完成（读数取舍 → 测次重排 → 主裂缝同步 → 建议重算 → 归并记录 → 删除被并裂缝），任一步失败整体回滚，原裂缝、测次与建议恢复原状；事务内先查重再写入，重试不会产生重复归并。
+

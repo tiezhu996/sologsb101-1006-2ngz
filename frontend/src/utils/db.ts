@@ -10,12 +10,13 @@ import type { Ring } from '@/types/ring'
 import type { Crack } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { CrackMerge } from '@/types/merge'
 
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbtunnelcrack'
 
 /** 当前数据结构版本号：调整表结构必须递增并补 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键名 */
 export const LS_KEYS = {
@@ -44,6 +45,8 @@ export interface BackupPayload {
   cracks: Crack[]
   surveys: Survey[]
   advices: Advice[]
+  /** v3 起补充裂缝归并记录；旧档导入时允许缺省 */
+  crackMerges?: CrackMerge[]
 }
 
 /** 带行修订号的持久化实体，便于逐行迁移 */
@@ -52,13 +55,14 @@ export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type SectionRow = Section & Revisioned
 export type RingRow = Ring & Revisioned
 export type CrackRow = Crack & Revisioned
 export type SurveyRow = Survey & Revisioned
 export type AdviceRow = Advice & Revisioned
+export type CrackMergeRow = CrackMerge & Revisioned
 
 class TunnelCrackDatabase extends Dexie {
   sections!: Table<SectionRow, string>
@@ -66,6 +70,7 @@ class TunnelCrackDatabase extends Dexie {
   cracks!: Table<CrackRow, string>
   surveys!: Table<SurveyRow, string>
   advices!: Table<AdviceRow, string>
+  crackMerges!: Table<CrackMergeRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -99,7 +104,7 @@ class TunnelCrackDatabase extends Dexie {
         ]
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION
+            row.revision = 2
           })
         }
 
@@ -125,6 +130,32 @@ class TunnelCrackDatabase extends Dexie {
               survey.deltaWidthMm = 0
             }
           })
+      })
+
+    // v3：新增裂缝归并记录表（被并编号与逐日期读数取舍留存，图表只认主裂缝）
+    this.version(DB_VERSION)
+      .stores({
+        sections: 'id, line, structureType, startMileage, updatedAt',
+        rings: 'id, sectionId, ringNo, mileage, segmentType, updatedAt',
+        cracks: 'id, ringId, sectionId, code, position, direction, state, updatedAt',
+        surveys: 'id, crackId, seq, date, surveyor, updatedAt',
+        advices: 'id, crackId, level, measure, state, updatedAt',
+        crackMerges: 'id, primaryCrackId, mergedCrackId, ringId, sectionId, mergedAt'
+      })
+      .upgrade(async (tx) => {
+        // 归并记录表为全新表；既有五行统一戳到行修订号 3
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('sections'),
+          tx.table('rings'),
+          tx.table('cracks'),
+          tx.table('surveys'),
+          tx.table('advices')
+        ]
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION
+          })
+        }
       })
   }
 }
@@ -184,7 +215,9 @@ const SEED_CRACKS: CrackRow[] = [
   { id: 'crack-3', ringId: 'ring-2', sectionId: 'sec-1', code: 'SL-132-01', position: '道床', direction: '斜向', widthMm: 0.55, lengthMm: 880, state: '待整治', createdAt: stamp(-104), updatedAt: stamp(-3), revision: ROW_REVISION },
   { id: 'crack-4', ringId: 'ring-3', sectionId: 'sec-1', code: 'SL-145-01', position: '拱顶', direction: '环向', widthMm: 0.24, lengthMm: 350, state: '观察', createdAt: stamp(-99), updatedAt: stamp(-9), revision: ROW_REVISION },
   { id: 'crack-5', ringId: 'ring-4', sectionId: 'sec-2', code: 'NL-027-01', position: '侧墙', direction: '纵向', widthMm: 0.38, lengthMm: 540, state: '已整治', createdAt: stamp(-88), updatedAt: stamp(-20), revision: ROW_REVISION },
-  { id: 'crack-6', ringId: 'ring-5', sectionId: 'sec-2', code: 'NL-041-01', position: '拱顶', direction: '斜向', widthMm: 0.12, lengthMm: 260, state: '观察', createdAt: stamp(-60), updatedAt: stamp(-6), revision: ROW_REVISION }
+  { id: 'crack-6', ringId: 'ring-5', sectionId: 'sec-2', code: 'NL-041-01', position: '拱顶', direction: '斜向', widthMm: 0.12, lengthMm: 260, state: '观察', createdAt: stamp(-60), updatedAt: stamp(-6), revision: ROW_REVISION },
+  // crack-7 与 crack-2 同环片（第118环）同编号 SL-118-02，系重复录入，待「裂缝归并」处理
+  { id: 'crack-7', ringId: 'ring-1', sectionId: 'sec-1', code: 'SL-118-02', position: '侧墙', direction: '环向', widthMm: 0.21, lengthMm: 435, state: '观察', createdAt: stamp(-75), updatedAt: stamp(-11), revision: ROW_REVISION }
 ]
 
 const SEED_SURVEYS: SurveyRow[] = [
@@ -207,7 +240,11 @@ const SEED_SURVEYS: SurveyRow[] = [
   { id: 'sv-5-1', crackId: 'crack-5', seq: 1, date: '2024-02-20', widthMm: 0.38, lengthMm: 540, deltaWidthMm: 0, surveyor: '陈立', createdAt: stamp(-121), updatedAt: stamp(-121), revision: ROW_REVISION },
   { id: 'sv-5-2', crackId: 'crack-5', seq: 2, date: '2024-03-21', widthMm: 0.46, lengthMm: 548, deltaWidthMm: 0.08, surveyor: '陈立', createdAt: stamp(-91), updatedAt: stamp(-91), revision: ROW_REVISION },
   // crack-6：仅初测一次
-  { id: 'sv-6-1', crackId: 'crack-6', seq: 1, date: '2024-05-06', widthMm: 0.12, lengthMm: 260, deltaWidthMm: 0, surveyor: '李文博', createdAt: stamp(-45), updatedAt: stamp(-45), revision: ROW_REVISION }
+  { id: 'sv-6-1', crackId: 'crack-6', seq: 1, date: '2024-05-06', widthMm: 0.12, lengthMm: 260, deltaWidthMm: 0, surveyor: '李文博', createdAt: stamp(-45), updatedAt: stamp(-45), revision: ROW_REVISION },
+  // crack-7：与 crack-2 重复录入；05-10 同日读数两本台账各一（0.21 vs 0.21），06-09 同日（0.27 较宽），另独有 03-12 初测
+  { id: 'sv-7-1', crackId: 'crack-7', seq: 1, date: '2024-03-12', widthMm: 0.16, lengthMm: 400, deltaWidthMm: 0, surveyor: '陈立', createdAt: stamp(-100), updatedAt: stamp(-100), revision: ROW_REVISION },
+  { id: 'sv-7-2', crackId: 'crack-7', seq: 2, date: '2024-05-10', widthMm: 0.21, lengthMm: 435, deltaWidthMm: 0.05, surveyor: '陈立', createdAt: stamp(-41), updatedAt: stamp(-41), revision: ROW_REVISION },
+  { id: 'sv-7-3', crackId: 'crack-7', seq: 3, date: '2024-06-09', widthMm: 0.27, lengthMm: 460, deltaWidthMm: 0.06, surveyor: '陈立', createdAt: stamp(-11), updatedAt: stamp(-11), revision: ROW_REVISION }
 ]
 
 const SEED_ADVICES: AdviceRow[] = [
@@ -219,13 +256,17 @@ const SEED_ADVICES: AdviceRow[] = [
 
 /** 幂等播种：仅当主表为空时写入演示数据 */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.rings.bulkPut(SEED_RINGS)
-    await db.cracks.bulkPut(SEED_CRACKS)
-    await db.surveys.bulkPut(SEED_SURVEYS)
-    await db.advices.bulkPut(SEED_ADVICES)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.crackMerges],
+    async () => {
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.rings.bulkPut(SEED_RINGS)
+      await db.cracks.bulkPut(SEED_CRACKS)
+      await db.surveys.bulkPut(SEED_SURVEYS)
+      await db.advices.bulkPut(SEED_ADVICES)
+    }
+  )
 }
 
 /** 应用启动时调用：打开数据库并在首屏为空时播种 */
@@ -238,30 +279,39 @@ export async function initDatabase(): Promise<void> {
 
 /* ============================== 级联删除 ============================== */
 
-/** 删除区间：级联删除环片 → 裂缝 → 复测 → 建议 */
+/** 删除区间：级联删除环片 → 裂缝 → 复测 → 建议 → 归并记录 */
 export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    const rings = await db.rings.where('sectionId').equals(sectionId).toArray()
-    const ringIds = rings.map((ring) => ring.id)
-    await deleteCracksOfRings(ringIds)
-    if (ringIds.length > 0) await db.rings.bulkDelete(ringIds)
-    await db.sections.delete(sectionId)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.crackMerges],
+    async () => {
+      const rings = await db.rings.where('sectionId').equals(sectionId).toArray()
+      const ringIds = rings.map((ring) => ring.id)
+      await deleteCracksOfRings(ringIds)
+      if (ringIds.length > 0) await db.rings.bulkDelete(ringIds)
+      await db.sections.delete(sectionId)
+    }
+  )
 }
 
 /** 删除环片：级联删除裂缝及其下游 */
 export async function deleteRingCascade(ringId: string): Promise<void> {
-  await db.transaction('rw', db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await deleteCracksOfRings([ringId])
-    await db.rings.delete(ringId)
-  })
+  await db.transaction(
+    'rw',
+    [db.rings, db.cracks, db.surveys, db.advices, db.crackMerges],
+    async () => {
+      await deleteCracksOfRings([ringId])
+      await db.rings.delete(ringId)
+    }
+  )
 }
 
-/** 删除裂缝：级联删除复测与建议 */
+/** 删除裂缝：级联删除复测、建议与涉及该裂缝的归并记录 */
 export async function deleteCrackCascade(crackId: string): Promise<void> {
-  await db.transaction('rw', db.cracks, db.surveys, db.advices, async () => {
+  await db.transaction('rw', [db.cracks, db.surveys, db.advices, db.crackMerges], async () => {
     await db.surveys.where('crackId').equals(crackId).delete()
     await db.advices.where('crackId').equals(crackId).delete()
+    await deleteMergesOfCracks([crackId])
     await db.cracks.delete(crackId)
   })
 }
@@ -273,32 +323,44 @@ async function deleteCracksOfRings(ringIds: string[]): Promise<void> {
   if (crackIds.length > 0) {
     await db.surveys.where('crackId').anyOf(crackIds).delete()
     await db.advices.where('crackId').anyOf(crackIds).delete()
+    await deleteMergesOfCracks(crackIds)
     await db.cracks.bulkDelete(crackIds)
   }
+}
+
+/** 删除主裂缝或被并裂缝涉及的全部归并记录 */
+async function deleteMergesOfCracks(crackIds: string[]): Promise<void> {
+  if (crackIds.length === 0) return
+  const byPrimary = await db.crackMerges.where('primaryCrackId').anyOf(crackIds).primaryKeys()
+  const byMerged = await db.crackMerges.where('mergedCrackId').anyOf(crackIds).primaryKeys()
+  const ids = Array.from(new Set([...byPrimary, ...byMerged]))
+  if (ids.length > 0) await db.crackMerges.bulkDelete(ids)
 }
 
 /* ============================ 整库导入导出 ============================ */
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, crackMerges] = await Promise.all([
     db.sections.count(),
     db.rings.count(),
     db.cracks.count(),
     db.surveys.count(),
-    db.advices.count()
+    db.advices.count(),
+    db.crackMerges.count()
   ])
-  return { sections, rings, cracks, surveys, advices }
+  return { sections, rings, cracks, surveys, advices, crackMerges }
 }
 
 /** 导出整库快照（剥离内部 revision 字段） */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, crackMerges] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.crackMerges.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -312,40 +374,52 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     rings: rings.map(strip),
     cracks: cracks.map(strip),
     surveys: surveys.map(strip),
-    advices: advices.map(strip)
+    advices: advices.map(strip),
+    crackMerges: crackMerges.map(strip)
   }
 }
 
 /** 用快照覆盖整库 */
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.rings.bulkPut((payload.rings ?? []).map(rev))
-    await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
-    await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
-    await db.advices.bulkPut((payload.advices ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.crackMerges],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.crackMerges.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.rings.bulkPut((payload.rings ?? []).map(rev))
+      await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
+      await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
+      await db.advices.bulkPut((payload.advices ?? []).map(rev))
+      await db.crackMerges.bulkPut((payload.crackMerges ?? []).map(rev))
+    }
+  )
 }
 
 /** 清空全部业务表 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.crackMerges],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.crackMerges.clear()
+      ])
+    }
+  )
 }
 
 /** 清空后重新播种（演示数据重置） */

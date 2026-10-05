@@ -2,11 +2,12 @@
 /**
  * /surveys 复测测次与变化量对比
  * 按测次追加读数，自动与前一次比对生成变化量，并用折线对比历次宽度。
- * 消费 Survey、Crack；复用 <FilterBar>、<EmptyPanel>、<LevelTag>。
+ * 同一环片重复录入的裂缝可在此发起「裂缝归并」：逐日期核对两边读数后合并到主裂缝。
+ * 消费 Survey、Crack、CrackMerge；复用 <FilterBar>、<EmptyPanel>、<LevelTag>。
  */
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Connection } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import LevelTag from '@/components/common/LevelTag.vue'
@@ -15,6 +16,9 @@ import { useCrackStore, type CrackEnriched } from '@/stores/crackStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useCrackTrend } from '@/hooks/useCrackTrend'
+import { useIdbTable } from '@/hooks/useIdbTable'
+import type { CrackMergeRow } from '@/utils/db'
+import { buildMergePreview, confirmCrackMerge, type MergePreview } from '@/utils/merge'
 import {
   EMPTY_SURVEY_DRAFT,
   type SurveyDraft
@@ -171,6 +175,159 @@ async function removeSurvey(surveyId: string, seq: number): Promise<void> {
 function selectCrack(crackId: string): void {
   surveyStore.setActiveCrack(crackId)
 }
+
+/* ---------------------------- 裂缝归并 ---------------------------- */
+
+const mergeTable = useIdbTable<CrackMergeRow>((database) => database.crackMerges, { sortByUpdatedAt: false })
+
+const mergeDialogVisible = ref(false)
+const mergeSubmitting = ref(false)
+const mergeLoading = ref(false)
+const mergePrimaryId = ref('')
+const mergeMergedId = ref('')
+const mergeReviewer = ref('')
+const mergePreview = ref<MergePreview | null>(null)
+/** key=重复日期，value=该日期保留的测次 id */
+const keptSurveyByDate = reactive<Record<string, string>>({})
+
+/** 主裂缝候选项（全部裂缝，归并不受当前筛选影响） */
+const mergePrimaryOptions = computed(() =>
+  crackStore.enriched.map((item) => ({
+    value: item.crack.id,
+    label: `${item.crack.code} · ${item.sectionLabel} · ${item.ringLabel}`
+  }))
+)
+
+const mergePrimaryCrack = computed(
+  () => crackStore.enriched.find((item) => item.crack.id === mergePrimaryId.value) ?? null
+)
+
+/** 被并裂缝候选项：只列同一环片的其它裂缝，跨环片不能直接并 */
+const mergeMergedOptions = computed(() =>
+  crackStore.enriched
+    .filter((item) => mergePrimaryId.value && item.crack.ringId === mergePrimaryCrack.value?.crack.ringId)
+    .filter((item) => item.crack.id !== mergePrimaryId.value)
+    .map((item) => ({
+      value: item.crack.id,
+      label: `${item.crack.code} · ${item.crack.position}/${item.crack.direction} · 测次 ${item.surveyCount}`
+    }))
+)
+
+function openMerge(): void {
+  mergePrimaryId.value = activeCrackId.value ?? ''
+  mergeMergedId.value = ''
+  mergeReviewer.value = ''
+  mergePreview.value = null
+  Object.keys(keptSurveyByDate).forEach((key) => delete keptSurveyByDate[key])
+  mergeDialogVisible.value = true
+  if (mergePrimaryId.value) void loadMergePreview()
+}
+
+async function onMergePrimaryChange(): Promise<void> {
+  mergeMergedId.value = ''
+  mergePreview.value = null
+  Object.keys(keptSurveyByDate).forEach((key) => delete keptSurveyByDate[key])
+  await loadMergePreview()
+}
+
+async function onMergeMergedChange(): Promise<void> {
+  await loadMergePreview()
+}
+
+async function loadMergePreview(): Promise<void> {
+  if (!mergePrimaryId.value || !mergeMergedId.value) {
+    mergePreview.value = null
+    return
+  }
+  mergeLoading.value = true
+  try {
+    const preview = await buildMergePreview(mergePrimaryId.value, mergeMergedId.value)
+    mergePreview.value = preview
+    Object.keys(keptSurveyByDate).forEach((key) => delete keptSurveyByDate[key])
+    preview?.duplicates.forEach((row) => {
+      keptSurveyByDate[row.date] = row.defaultKeptSurveyId
+    })
+  } catch (error) {
+    mergePreview.value = null
+    ElMessage.error(`归并预览加载失败：${error instanceof Error ? error.message : '未知错误'}`)
+  } finally {
+    mergeLoading.value = false
+  }
+}
+
+/** 重复日期是否全部已核对（漏选时不允许保存） */
+const unresolvedDuplicateDates = computed(() =>
+  mergePreview.value
+    ? mergePreview.value.duplicates.filter((row) => !keptSurveyByDate[row.date]).map((row) => row.date)
+    : []
+)
+
+const mergeConfirmDisabled = computed(
+  () =>
+    mergeSubmitting.value ||
+    mergeLoading.value ||
+    !mergePreview.value ||
+    mergePreview.value.blockReason !== null ||
+    unresolvedDuplicateDates.value.length > 0 ||
+    mergeReviewer.value.trim().length === 0
+)
+
+function keptCellClass(date: string, surveyId: string): string {
+  return keptSurveyByDate[date] === surveyId ? 'is-kept' : 'is-dropped'
+}
+
+async function submitMerge(): Promise<void> {
+  if (!mergePreview.value) return
+  if (mergePreview.value.blockReason) {
+    ElMessage.warning(mergePreview.value.blockReason)
+    return
+  }
+  if (unresolvedDuplicateDates.value.length > 0) {
+    ElMessage.warning(`重复日期 ${unresolvedDuplicateDates.value.join('、')} 的读数尚未核对选择`)
+    return
+  }
+  const { primary, merged } = mergePreview.value
+  const confirmed = await ElMessageBox.confirm(
+    `确认把「${merged.code}」归并入主裂缝「${primary.code}」？归并后被并编号注销，仅留存于归并记录，测次将按日期重排并重算变化量与建议。`,
+    '归并确认',
+    { type: 'warning', confirmButtonText: '确认归并', cancelButtonText: '取消' }
+  ).catch(() => false)
+  if (!confirmed) return
+
+  mergeSubmitting.value = true
+  try {
+    const result = await confirmCrackMerge({
+      primaryCrackId: primary.id,
+      mergedCrackId: merged.id,
+      keptSurveyByDate: { ...keptSurveyByDate },
+      reviewer: mergeReviewer.value
+    })
+    ElMessage.success(
+      `已归并 ${result.merge.mergedCode} → ${result.merge.primaryCode}，归并后 ${result.surveyCountAfter} 个测次，月均速率 ${result.latestRate.toFixed(3)} mm/月`
+    )
+    surveyStore.setActiveCrack(primary.id)
+    mergeDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(`归并未生效，数据已恢复：${error instanceof Error ? error.message : '未知错误'}`)
+  } finally {
+    mergeSubmitting.value = false
+  }
+}
+
+/** 当前主裂缝（或所选待并裂缝）的归并记录 */
+const mergeHistory = computed(() => {
+  const watchId = mergeDialogVisible.value ? mergePrimaryId.value : activeCrackId.value
+  if (!watchId) return [] as CrackMergeRow[]
+  return mergeTable.rows.value
+    .filter((record) => record.primaryCrackId === watchId || record.mergedCrackId === watchId)
+    .sort((a, b) => b.mergedAt - a.mergedAt)
+})
+
+function formatMergeTime(value: number): string {
+  const date = new Date(value)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
 </script>
 
 <template>
@@ -183,6 +340,7 @@ function selectCrack(crackId: string): void {
         </p>
       </div>
       <div class="page-head__actions">
+        <el-button :icon="Connection" @click="openMerge">裂缝归并</el-button>
         <el-button type="primary" :icon="Plus" :disabled="!activeCrackId" @click="openCreate">追加测次</el-button>
       </div>
     </div>
@@ -323,6 +481,19 @@ function selectCrack(crackId: string): void {
               </template>
             </el-table-column>
           </el-table>
+
+          <div v-if="mergeHistory.length > 0" class="panel merge-history">
+            <h4 class="panel-subtitle" style="margin-top: 0">归并记录</h4>
+            <div v-for="record in mergeHistory" :key="record.id" class="merge-history__item">
+              <el-tag size="small" type="info">{{ formatMergeTime(record.mergedAt).slice(0, 10) }}</el-tag>
+              <span>
+                被并编号 <strong>{{ record.mergedCode }}</strong> 已归入
+                <strong>{{ record.primaryCode }}</strong>
+                （重复日期 {{ record.duplicates.length }} 个，转入 {{ record.transferredSurveyIds.length }} 个独有测次，归并后
+                {{ record.surveyCountAfter }} 测次，核验人 {{ record.reviewer }}）
+              </span>
+            </div>
+          </div>
         </template>
 
         <EmptyPanel
@@ -360,6 +531,165 @@ function selectCrack(crackId: string): void {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="mergeDialogVisible" title="裂缝归并" width="860px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="用于同一环片重复录入的两条裂缝：先按日期核对两边测次，每个重复日期保留一条读数，确认后被并编号注销、仅留存在归并记录中，图表只认主裂缝。"
+        style="margin-bottom: 14px"
+      />
+
+      <el-form label-width="100px">
+        <el-form-item label="主裂缝">
+          <el-select
+            v-model="mergePrimaryId"
+            filterable
+            placeholder="选择归并后保留的裂缝"
+            style="width: 100%"
+            @change="onMergePrimaryChange"
+          >
+            <el-option v-for="item in mergePrimaryOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="被并裂缝">
+          <el-select
+            v-model="mergeMergedId"
+            filterable
+            :placeholder="
+              mergePrimaryId ? '只能选择同一环片上的其它裂缝' : '请先选择主裂缝'
+            "
+            :disabled="!mergePrimaryId || mergeMergedOptions.length === 0"
+            style="width: 100%"
+            @change="onMergeMergedChange"
+          >
+            <el-option v-for="item in mergeMergedOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <span v-if="mergePrimaryId && mergeMergedOptions.length === 0" class="muted" style="margin-left: 10px">
+            该环片上没有其它裂缝可归并
+          </span>
+        </el-form-item>
+      </el-form>
+
+      <el-alert
+        v-if="mergePreview?.blockReason"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="mergePreview.blockReason"
+        style="margin-bottom: 12px"
+      />
+
+      <div v-loading="mergeLoading">
+        <template v-if="mergePreview && !mergePreview.blockReason">
+          <h4 class="panel-subtitle">
+            逐日期读数核对
+            <span class="muted">
+              重复日期 {{ mergePreview.duplicates.length }} 个 · 被并转入 {{ mergePreview.mergedOnlyDates.length }} 次
+              · 主裂缝独有 {{ mergePreview.primaryOnlyDates.length }} 次
+            </span>
+          </h4>
+          <el-table :data="mergePreview.rows" border stripe size="small">
+            <el-table-column prop="date" label="复测日期" width="110" />
+            <el-table-column label="主裂缝读数" width="210">
+              <template #default="{ row }">
+                <template v-if="row.primarySurvey">
+                  <el-radio
+                    v-model="keptSurveyByDate[row.date]"
+                    :value="row.primarySurvey.id"
+                    :disabled="!row.duplicate"
+                  >
+                    <span class="merge-readout" :class="row.duplicate ? keptCellClass(row.date, row.primarySurvey.id) : ''">
+                      {{ row.primarySurvey.widthMm.toFixed(2) }} mm / {{ row.primarySurvey.lengthMm }} mm
+                    </span>
+                  </el-radio>
+                  <span class="muted"> · {{ row.primarySurvey.surveyor }}</span>
+                </template>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="被并裂缝读数" width="210">
+              <template #default="{ row }">
+                <template v-if="row.mergedSurvey">
+                  <el-radio
+                    v-model="keptSurveyByDate[row.date]"
+                    :value="row.mergedSurvey.id"
+                    :disabled="!row.duplicate"
+                  >
+                    <span class="merge-readout" :class="row.duplicate ? keptCellClass(row.date, row.mergedSurvey.id) : ''">
+                      {{ row.mergedSurvey.widthMm.toFixed(2) }} mm / {{ row.mergedSurvey.lengthMm }} mm
+                    </span>
+                  </el-radio>
+                  <span class="muted"> · {{ row.mergedSurvey.surveyor }}</span>
+                </template>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="处理方式" min-width="180">
+              <template #default="{ row }">
+                <el-tag v-if="row.duplicate" type="warning" size="small">
+                  重复日期二选一 · {{ unresolvedDuplicateDates.includes(row.date) ? '待核对' : '已核对' }}
+                </el-tag>
+                <el-tag v-else-if="row.mergedSurvey" type="success" size="small">被并独有，转入主裂缝</el-tag>
+                <el-tag v-else type="info" size="small">主裂缝独有，保留</el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+          <p class="muted" style="margin: 8px 0 0; font-size: 12px">
+            默认保留宽度较大的读数，宽度相同时默认保留主裂缝；核验人可逐条改选，漏选时无法保存。
+          </p>
+
+          <el-form label-width="100px" style="margin-top: 16px">
+            <el-form-item
+              label="核验人"
+              required
+              :error="mergeReviewer.trim() ? '' : '请填写核验人'"
+            >
+              <el-input v-model="mergeReviewer" placeholder="谁核对谁签字，如 周维" style="width: 260px" />
+            </el-form-item>
+          </el-form>
+        </template>
+
+        <el-empty
+          v-else-if="!mergePreview && mergePrimaryId && mergeMergedId && !mergeLoading"
+          description="预览生成失败，请重新选择裂缝"
+          :image-size="60"
+        />
+        <el-empty
+          v-else-if="!mergePrimaryId || !mergeMergedId"
+          description="选择主裂缝与同一环片上的被并裂缝后，在此按日期预览两边测次"
+          :image-size="60"
+        />
+      </div>
+
+      <template v-if="mergeHistory.length > 0">
+        <el-divider content-position="left">归并记录</el-divider>
+        <el-timeline>
+          <el-timeline-item
+            v-for="record in mergeHistory"
+            :key="record.id"
+            :timestamp="`${formatMergeTime(record.mergedAt)} · 核验人 ${record.reviewer}`"
+            placement="top"
+            type="primary"
+          >
+            <span v-if="record.primaryCrackId === mergePrimaryId">
+              被并编号 <strong>{{ record.mergedCode }}</strong> 已归入
+              <strong>{{ record.primaryCode }}</strong>
+              （重复日期 {{ record.duplicates.length }} 个，归并后 {{ record.surveyCountAfter }} 个测次）
+            </span>
+            <span v-else>本裂缝编号 <strong>{{ record.mergedCode }}</strong> 已归入 {{ record.primaryCode }}</span>
+          </el-timeline-item>
+        </el-timeline>
+      </template>
+
+      <template #footer>
+        <el-button @click="mergeDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="mergeSubmitting" :disabled="mergeConfirmDisabled" @click="submitMerge">
+          确认归并
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -382,6 +712,33 @@ function selectCrack(crackId: string): void {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+.merge-readout {
+  font-weight: 600;
+}
+
+.merge-readout.is-kept {
+  color: #1e8449;
+}
+
+.merge-readout.is-dropped {
+  color: #9aa6b5;
+  text-decoration: line-through;
+}
+
+.merge-history {
+  margin-top: 14px;
+}
+
+.merge-history__item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px dashed #e3e8f0;
+  font-size: 13px;
 }
 
 svg text {
